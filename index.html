@@ -1,71 +1,462 @@
-// Simple WebSocket relay server
-// Run with: npm install ws
-// Then: node server.js
-
-const WebSocket = require("ws");
-
-const wss = new WebSocket.Server({ port: 8080 });
-const rooms = new Map(); // roomName -> Set of sockets
-
-function joinRoom(room, ws) {
-  if (!rooms.has(room)) {
-    rooms.set(room, new Set());
-  }
-  rooms.get(room).add(ws);
-}
-
-function leaveAllRooms(ws) {
-  for (const [room, clients] of rooms.entries()) {
-    clients.delete(ws);
-    if (clients.size === 0) {
-      rooms.delete(room);
-    }
-  }
-}
-
-function broadcastToRoom(room, sender, data) {
-  const clients = rooms.get(room);
-  if (!clients) return;
-
-  for (const client of clients) {
-    if (client !== sender && client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(data));
-    }
-  }
-}
-
-wss.on("connection", (ws) => {
-  ws.room = null;
-
-  ws.on("message", (raw) => {
-    let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Linked Browsers</title>
+  <style>
+    * {
+      box-sizing: border-box;
     }
 
-    if (msg.type === "join") {
-      leaveAllRooms(ws);
-      ws.room = msg.room;
-      joinRoom(msg.room, ws);
-
-      ws.send(JSON.stringify({
-        type: "system",
-        text: `Joined room: ${msg.room}`
-      }));
-      return;
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(20, 70, 100, 0.25), transparent 30%),
+        radial-gradient(circle at 80% 20%, rgba(90, 20, 60, 0.2), transparent 26%),
+        radial-gradient(circle at 50% 80%, rgba(255, 160, 80, 0.08), transparent 25%),
+        #05070b;
+      color: white;
+      font-family: Inter, Arial, sans-serif;
     }
 
-    if (!ws.room) return;
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
 
-    // Relay movement/update messages to everyone else in the same room
-    broadcastToRoom(ws.room, ws, msg);
-  });
+    .hud {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 12px;
+      border-radius: 16px;
+      background: rgba(4, 8, 16, 0.55);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+    }
 
-  ws.on("close", () => {
-    leaveAllRooms(ws);
-  });
-});
+    .hud input,
+    .hud button {
+      border: none;
+      outline: none;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
 
-console.log("WebSocket server running on ws://localhost:8080");
+    .hud input {
+      width: 160px;
+      background: rgba(255, 255, 255, 0.08);
+      color: white;
+    }
+
+    .hud button {
+      background: linear-gradient(135deg, rgba(34, 197, 94, 0.9), rgba(14, 165, 233, 0.9));
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .hud .status {
+      font-size: 13px;
+      opacity: 0.9;
+      min-width: 140px;
+    }
+
+    .hint {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      z-index: 10;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(4, 8, 16, 0.48);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 13px;
+      opacity: 0.9;
+      backdrop-filter: blur(10px);
+      max-width: min(380px, 90vw);
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <input id="roomInput" value="demo-room" />
+    <button id="joinBtn">Join</button>
+    <div class="status" id="status">Disconnected</div>
+  </div>
+
+  <div class="hint">
+    Drag your own energy orb. Open the same room in another browser window and the two blobs will link.
+  </div>
+
+  <canvas id="scene"></canvas>
+
+  <script>
+    const canvas = document.getElementById("scene");
+    const ctx = canvas.getContext("2d");
+
+    const roomInput = document.getElementById("roomInput");
+    const joinBtn = document.getElementById("joinBtn");
+    const statusEl = document.getElementById("status");
+
+    let socket = null;
+    let selfId = null;
+    let peers = [];
+    let dragging = false;
+    let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+    function resize() {
+      canvas.width = Math.floor(window.innerWidth * dpr);
+      canvas.height = Math.floor(window.innerHeight * dpr);
+      canvas.style.width = window.innerWidth + "px";
+      canvas.style.height = window.innerHeight + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    resize();
+    window.addEventListener("resize", resize);
+
+    function connect() {
+      if (
+        socket &&
+        (socket.readyState === WebSocket.OPEN ||
+          socket.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      socket = new WebSocket(`${protocol}//${location.host}`);
+
+      socket.addEventListener("open", () => {
+        statusEl.textContent = "Connected";
+        joinRoom();
+      });
+
+      socket.addEventListener("message", (event) => {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === "snapshot") {
+          selfId = msg.selfId;
+          peers = msg.peers;
+          statusEl.textContent = `Connected · ${peers.length} browser${peers.length === 1 ? "" : "s"}`;
+        }
+      });
+
+      socket.addEventListener("close", () => {
+        statusEl.textContent = "Disconnected";
+      });
+
+      socket.addEventListener("error", () => {
+        statusEl.textContent = "Connection error";
+      });
+    }
+
+    function joinRoom() {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+      socket.send(
+        JSON.stringify({
+          type: "join",
+          room: roomInput.value.trim() || "demo-room",
+        })
+      );
+    }
+
+    function sendMove(x, y) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+      socket.send(
+        JSON.stringify({
+          type: "move",
+          x,
+          y,
+        })
+      );
+    }
+
+    joinBtn.addEventListener("click", () => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        connect();
+      } else {
+        joinRoom();
+      }
+    });
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function getPeerById(id) {
+      return peers.find((peer) => peer.id === id);
+    }
+
+    function worldToScreen(peer) {
+      return {
+        x: peer.x * canvas.clientWidth,
+        y: peer.y * canvas.clientHeight,
+      };
+    }
+
+    function pointerPosition(event) {
+      const rect = canvas.getBoundingClientRect();
+
+      return {
+        x: clamp((event.clientX - rect.left) / rect.width, 0.02, 0.98),
+        y: clamp((event.clientY - rect.top) / rect.height, 0.04, 0.96),
+      };
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      const selfPeer = getPeerById(selfId);
+      if (!selfPeer) return;
+
+      const p = pointerPosition(event);
+      const screen = worldToScreen(selfPeer);
+
+      const dx = event.clientX - screen.x;
+      const dy = event.clientY - screen.y;
+      const distance = Math.hypot(dx, dy);
+
+      if (distance < 90) {
+        dragging = true;
+        canvas.setPointerCapture(event.pointerId);
+        sendMove(p.x, p.y);
+      }
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!dragging) return;
+      const p = pointerPosition(event);
+      sendMove(p.x, p.y);
+    });
+
+    function stopDrag() {
+      dragging = false;
+    }
+
+    canvas.addEventListener("pointerup", stopDrag);
+    canvas.addEventListener("pointercancel", stopDrag);
+    canvas.addEventListener("pointerleave", stopDrag);
+
+    function glowColor(hue, alpha) {
+      return `hsla(${hue}, 95%, 60%, ${alpha})`;
+    }
+
+    function coreColor(hue, alpha) {
+      return `hsla(${hue}, 90%, 70%, ${alpha})`;
+    }
+
+    function drawBackground(time) {
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+
+      const bg = ctx.createLinearGradient(0, 0, 0, h);
+      bg.addColorStop(0, "#03060b");
+      bg.addColorStop(1, "#070c14");
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, w, h);
+
+      for (let i = 0; i < 40; i++) {
+        const x = (i * 211.7 + time * 0.005 * (i % 3 + 1)) % (w + 200) - 100;
+        const y = (i * 97.3) % h;
+        const radius = 1 + (i % 3);
+
+        ctx.beginPath();
+        ctx.fillStyle = "rgba(255,255,255,0.03)";
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawBlob(peer, time, isSelf) {
+      const { x, y } = worldToScreen(peer);
+      const baseRadius = Math.min(canvas.clientWidth, canvas.clientHeight) * 0.085;
+      const hue = peer.hue;
+      const pulse = 1 + Math.sin(time * 0.003 + hue) * 0.04;
+      const radius = baseRadius * pulse;
+
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.globalCompositeOperation = "lighter";
+
+      for (let layer = 0; layer < 3; layer++) {
+        ctx.beginPath();
+        const points = 64;
+
+        for (let i = 0; i <= points; i++) {
+          const a = (i / points) * Math.PI * 2;
+          const wobble = Math.sin(a * (3 + layer) + time * 0.0022 + hue * 0.05) * 8;
+          const wobble2 = Math.cos(a * 5 - time * 0.0017 + layer * 1.3) * 5;
+          const r = radius + wobble + wobble2 - layer * 6;
+          const px = Math.cos(a) * r;
+          const py = Math.sin(a) * r;
+
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+
+        const grad = ctx.createRadialGradient(0, 0, radius * 0.05, 0, 0, radius * 1.25);
+        grad.addColorStop(0, coreColor(hue, 0.26));
+        grad.addColorStop(0.3, glowColor(hue, 0.12));
+        grad.addColorStop(1, glowColor(hue, 0));
+
+        ctx.fillStyle = grad;
+        ctx.fill();
+      }
+
+      for (let i = 0; i < 36; i++) {
+        const a = (i / 36) * Math.PI * 2 + time * 0.0004 * (i % 2 ? 1 : -1);
+        const r = radius + 8 + Math.sin(time * 0.003 + i) * 10;
+        const px = Math.cos(a) * r;
+        const py = Math.sin(a) * r;
+        const pr = 1.5 + (i % 4) * 0.65;
+
+        ctx.beginPath();
+        ctx.fillStyle = glowColor(hue, 0.42);
+        ctx.arc(px, py, pr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.beginPath();
+      const inner = ctx.createRadialGradient(0, 0, 0, 0, 0, radius * 0.6);
+      inner.addColorStop(0, coreColor(hue, 0.95));
+      inner.addColorStop(0.45, glowColor(hue, 0.5));
+      inner.addColorStop(1, glowColor(hue, 0));
+
+      ctx.fillStyle = inner;
+      ctx.arc(0, 0, radius * 0.42, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = "rgba(255,255,255,0.92)";
+      ctx.font = "600 14px Inter, Arial, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(isSelf ? "You" : peer.label, 0, radius + 24);
+
+      ctx.restore();
+    }
+
+    function bezierPoint(t, p0, p1, p2, p3) {
+      const mt = 1 - t;
+      const mt2 = mt * mt;
+      const t2 = t * t;
+
+      return {
+        x: mt2 * mt * p0.x + 3 * mt2 * t * p1.x + 3 * mt * t2 * p2.x + t2 * t * p3.x,
+        y: mt2 * mt * p0.y + 3 * mt2 * t * p1.y + 3 * mt * t2 * p2.y + t2 * t * p3.y,
+      };
+    }
+
+    function drawBridge(aPeer, bPeer, time) {
+      const a = worldToScreen(aPeer);
+      const b = worldToScreen(bPeer);
+
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const distance = Math.hypot(dx, dy);
+
+      if (distance < 20) return;
+
+      const nx = dx / distance;
+      const ny = dy / distance;
+      const px = -ny;
+      const py = nx;
+      const bend = Math.sin(time * 0.0025) * Math.min(80, distance * 0.12);
+
+      const start = { x: a.x + nx * 55, y: a.y + ny * 10 };
+      const end = { x: b.x - nx * 55, y: b.y - ny * 10 };
+      const c1 = { x: a.x + dx * 0.28 + px * bend, y: a.y + dy * 0.18 + py * bend };
+      const c2 = { x: a.x + dx * 0.72 - px * bend, y: a.y + dy * 0.82 - py * bend };
+
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+
+      for (let i = 0; i < 4; i++) {
+        ctx.beginPath();
+        ctx.moveTo(start.x, start.y);
+        ctx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, end.x, end.y);
+        ctx.lineWidth = 26 - i * 6;
+        ctx.strokeStyle =
+          i < 2
+            ? glowColor(aPeer.hue, 0.06 - i * 0.015)
+            : glowColor(bPeer.hue, 0.09 - (i - 2) * 0.02);
+        ctx.stroke();
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, end.x, end.y);
+
+      const grad = ctx.createLinearGradient(start.x, start.y, end.x, end.y);
+      grad.addColorStop(0, glowColor(aPeer.hue, 0.45));
+      grad.addColorStop(0.5, "rgba(255,255,255,0.35)");
+      grad.addColorStop(1, glowColor(bPeer.hue, 0.45));
+
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = grad;
+      ctx.stroke();
+
+      for (let i = 0; i < 26; i++) {
+        const t = ((time * 0.00018) + i / 26) % 1;
+        const point = bezierPoint(t, start, c1, c2, end);
+
+        ctx.beginPath();
+        ctx.fillStyle = i % 2 ? glowColor(aPeer.hue, 0.55) : glowColor(bPeer.hue, 0.55);
+        ctx.arc(point.x, point.y, 1.6 + (i % 3) * 0.55, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function render(time) {
+      drawBackground(time);
+
+      const visiblePeers = peers.slice(0, 6);
+
+      if (visiblePeers.length >= 2) {
+        for (let i = 0; i < visiblePeers.length; i++) {
+          for (let j = i + 1; j < visiblePeers.length; j++) {
+            const pa = visiblePeers[i];
+            const pb = visiblePeers[j];
+
+            const ax = pa.x * canvas.clientWidth;
+            const ay = pa.y * canvas.clientHeight;
+            const bx = pb.x * canvas.clientWidth;
+            const by = pb.y * canvas.clientHeight;
+
+            const distance = Math.hypot(bx - ax, by - ay);
+
+            if (distance < Math.min(canvas.clientWidth, canvas.clientHeight) * 0.55) {
+              drawBridge(pa, pb, time);
+            }
+          }
+        }
+      }
+
+      for (const peer of visiblePeers) {
+        drawBlob(peer, time, peer.id === selfId);
+      }
+
+      requestAnimationFrame(render);
+    }
+
+    connect();
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>
